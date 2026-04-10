@@ -1,4 +1,4 @@
-# XanhSM Passenger Booking Workflow — Voice AI Agent
+# XanhSM Passenger Booking Workflow - Voice AI Agent
 
 A voice-based taxi booking agent powered by the **Gemini Live API** (native audio) and **Telcoflow SDK** (telephony). When a customer calls in, the agent follows a strict state-machine workflow to collect booking details and confirm a taxi reservation.
 
