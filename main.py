@@ -8,7 +8,7 @@ State machine:
   1. Greet → identify taxi-booking intent
   2. Collect & confirm: pickup, destination, phone number, date/time
   3. make_booking  (tool call – all 4 fields required)
-  4. Inform user → confirmation sent to XanhSM App
+  4. Inform user → confirmation sent
   5. hang_up_call  (tool call – terminates session)
 """
 
@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from telcoflow_sdk import TelcoflowClient, TelcoflowClientConfig, ActiveCall
@@ -24,6 +25,8 @@ import telcoflow_sdk.events as events
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+load_dotenv()
 
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
