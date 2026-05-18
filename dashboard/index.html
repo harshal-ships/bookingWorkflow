@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XanhSM Agent Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">XS</div>
+          <div>
+            <p class="eyebrow">XanhSM Operations</p>
+            <h1>Agent Dashboard</h1>
+          </div>
+        </div>
+
+        <section class="panel compact">
+          <div class="panel-header">
+            <span>Connection</span>
+            <span id="connectionBadge" class="badge badge-warning">Connecting</span>
+          </div>
+          <dl class="metrics">
+            <div>
+              <dt>Active Call</dt>
+              <dd id="activeCall">Waiting</dd>
+            </div>
+            <div>
+              <dt>Last Event</dt>
+              <dd id="lastEvent">None</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <span>Workflow Progress</span>
+          </div>
+          <ol id="workflowSteps" class="steps">
+            <li data-step="call_started" class="active">Call connected</li>
+            <li data-step="collecting">Collect details</li>
+            <li data-step="tool_call">Create booking</li>
+            <li data-step="booking_confirmed">Booking confirmed</li>
+            <li data-step="call_ended">Call ended</li>
+          </ol>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="hero">
+          <div>
+            <p class="eyebrow">Post-call intelligence and fulfillment oversight</p>
+            <h2>Customer booking interaction review</h2>
+            <p class="subtle">
+              Analyze completed customer conversations, validate extracted booking details, monitor fulfillment outcomes, and review operational activity from a single executive-ready workspace.
+            </p>
+          </div>
+          <div class="hero-card">
+            <span class="label">Booking Status</span>
+            <strong id="bookingStatus">Awaiting call</strong>
+          </div>
+        </header>
+
+        <section class="grid">
+          <section class="panel transcript-panel">
+            <div class="panel-header">
+              <div>
+                <span>Post-call Transcript</span>
+                <p class="panel-note">Final customer and agent turns appear after the call has completed.</p>
+              </div>
+              <button id="clearTranscript" class="button" type="button">Clear view</button>
+            </div>
+            <dl class="transcript-summary">
+              <div>
+                <dt>Status</dt>
+                <dd id="transcriptStatus">Waiting for call</dd>
+              </div>
+              <div>
+                <dt>Total Turns</dt>
+                <dd id="totalTurns">0</dd>
+              </div>
+              <div>
+                <dt>Customer Turns</dt>
+                <dd id="customerTurns">0</dd>
+              </div>
+              <div>
+                <dt>Agent Turns</dt>
+                <dd id="agentTurns">0</dd>
+              </div>
+            </dl>
+            <div id="transcript" class="transcript empty">
+              <div class="empty-state">
+                <strong>No completed transcript yet</strong>
+                <span>Place a test call. Final transcript data will appear after the call ends.</span>
+              </div>
+            </div>
+          </section>
+
+          <aside class="right-column">
+            <section class="panel booking-card">
+              <div class="panel-header">
+                <span>Booking Details</span>
+                <span id="bookingBadge" class="badge">Pending</span>
+              </div>
+              <dl class="details">
+                <div>
+                  <dt>Pickup</dt>
+                  <dd id="pickup">-</dd>
+                </div>
+                <div>
+                  <dt>Destination</dt>
+                  <dd id="destination">-</dd>
+                </div>
+                <div>
+                  <dt>Phone</dt>
+                  <dd id="phone">-</dd>
+                </div>
+                <div>
+                  <dt>Date / Time</dt>
+                  <dd id="dateTime">-</dd>
+                </div>
+                <div>
+                  <dt>Booking ID</dt>
+                  <dd id="bookingId">-</dd>
+                </div>
+              </dl>
+            </section>
+
+            <section class="panel events-card">
+              <div class="panel-header">
+                <span>System Events</span>
+              </div>
+              <ul id="events" class="events"></ul>
+            </section>
+          </aside>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
