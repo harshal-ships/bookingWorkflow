@@ -32,7 +32,7 @@ cd bookingWorkflow
 python -m venv .venv && source .venv/bin/activate
 
 # Install dependencies (telcoflow-sdk is on Test PyPI)
-pip install -r requirements.txt --extra-index-url https://test.pypi.org/simple/
+pip install -r requirements.txt
 
 # Configure environment variables
 cp .env.example .env
