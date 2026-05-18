@@ -44,6 +44,11 @@ cp .env.example .env
 ```bash
 python main.py
 ```
+The full booking agent also starts a local live dashboard by default:
+
+```text
+http://127.0.0.1:8000
+```
 
 The agent will start listening for incoming calls via Telcoflow. Dial the number associated with your connector UUID to begin a booking session.
 
