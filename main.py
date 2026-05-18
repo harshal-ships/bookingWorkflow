@@ -10,27 +10,87 @@ State machine:
   3. make_booking  (tool call – all 4 fields required)
   4. Inform user → confirmation sent
   5. hang_up_call  (tool call – terminates session)
+
+Patterns align with Gemini Live ↔ Telcoflow examples: structured logging,
+`CallEvent.CALL_TERMINATED` cleanup, dedicated asyncio tasks with
+cancel-safe shutdown, and explicit handling of Gemini / WebSocket closures.
 """
 
 import asyncio
-import json
+import logging
 import os
-
+from contextlib import suppress
+from typing import Optional
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
+from google.genai.live import AsyncSession
 from telcoflow_sdk import TelcoflowClient, TelcoflowClientConfig, ActiveCall
-import telcoflow_sdk.events as events
+from telcoflow_sdk.events import CallEvent, ClientEvent
+from telcoflow_sdk.exceptions import BufferFullError
+from websockets import ConnectionClosed
+
+from dashboard_state import (
+    emit_booking_confirmed,
+    emit_call_answered,
+    emit_call_ended,
+    emit_call_started,
+    emit_error,
+    emit_tool_call,
+    emit_transcript,
+)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & logging
 # ---------------------------------------------------------------------------
 
 load_dotenv()
 
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+def _gemini_developer_client() -> genai.Client:
+    """Gemini Developer API client.
+
+    google-genai probes GOOGLE_API_KEY and GEMINI_API_KEY and warns if both
+    are set; temporarily hide GOOGLE_API_KEY when GEMINI_API_KEY is preferred.
+    """
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY for Gemini Live.")
+    google_backup = None
+    if os.getenv("GEMINI_API_KEY") and os.getenv("GOOGLE_API_KEY"):
+        google_backup = os.environ.pop("GOOGLE_API_KEY")
+    try:
+        return genai.Client(vertexai=False, api_key=key)
+    finally:
+        if google_backup is not None:
+            os.environ["GOOGLE_API_KEY"] = google_backup
+
+
+genai_client = _gemini_developer_client()
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
-SAMPLE_RATE = 24000
+SAMPLE_RATE = int(os.getenv("TELCOFLOW_SAMPLE_RATE", "24000"))
+POST_BOOKING_HANG_UP_DELAY_SECONDS = float(
+    os.getenv("POST_BOOKING_HANG_UP_DELAY_SECONDS", "7")
+)
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
+
+GREETING_KICKOFF_REALTIME_TEXT = (
+    "The inbound phone call is now connected — the caller is on the line and can hear you. "
+    "Speak aloud your opening greeting immediately, following your system instructions."
+)
 
 SYSTEM_INSTRUCTION = """
 You are **BookBot**, the official voice-based taxi booking assistant for **XanhSM**.
@@ -79,6 +139,7 @@ terminate the session. Do NOT continue the conversation after this point.
   "I'm here to help you book a taxi. Shall we continue with your booking?"
 - Keep responses short and natural for a phone conversation.
 """.strip()
+
 
 # ---------------------------------------------------------------------------
 # Tool / Function Declarations (Gemini Live function-calling format)
@@ -131,6 +192,21 @@ TOOLS = [
     {"function_declarations": [MAKE_BOOKING_DECLARATION, HANG_UP_CALL_DECLARATION]}
 ]
 
+LIVE_CONNECT_CONFIG = types.LiveConnectConfig(
+    response_modalities=[types.Modality.AUDIO],
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon")
+        )
+    ),
+    system_instruction=SYSTEM_INSTRUCTION,
+    tools=TOOLS,
+    # Request caller + model audio transcripts (surfaced on `server_content`).
+    input_audio_transcription=types.AudioTranscriptionConfig(),
+    output_audio_transcription=types.AudioTranscriptionConfig(),
+)
+
+
 # ---------------------------------------------------------------------------
 # Mock tool implementations
 # ---------------------------------------------------------------------------
@@ -138,14 +214,14 @@ TOOLS = [
 
 def handle_make_booking(args: dict) -> dict:
     """Simulate a successful booking against the XanhSM backend."""
-    print("\n" + "=" * 60)
-    print("  BOOKING CREATED (mock)")
-    print("=" * 60)
-    print(f"  Pick-up  : {args.get('pickup_location')}")
-    print(f"  Dest     : {args.get('destination')}")
-    print(f"  Phone    : {args.get('phone_number')}")
-    print(f"  Date/Time: {args.get('date_time')}")
-    print("=" * 60 + "\n")
+    logger.info("BOOKING CREATED (mock)")
+    logger.info(
+        "pickup=%s dest=%s phone=%s when=%s",
+        args.get("pickup_location"),
+        args.get("destination"),
+        args.get("phone_number"),
+        args.get("date_time"),
+    )
     return {
         "status": "success",
         "booking_id": "XSM-20260409-0042",
@@ -153,97 +229,232 @@ def handle_make_booking(args: dict) -> dict:
     }
 
 
-def handle_hang_up_call() -> dict:
-    print("[hang_up_call] Ending the call.")
+def handle_hang_up_call(args: dict) -> dict:
+    """Return payload for hang_up_call; signalling is handled in receive loop."""
+    _ = args
+    logger.info("hang_up_call tool invoked")
     return {"status": "success", "message": "Call terminated."}
 
 
 TOOL_HANDLERS = {
-    "make_booking": lambda args: handle_make_booking(args),
-    "hang_up_call": lambda _: handle_hang_up_call(),
+    "make_booking": handle_make_booking,
+    "hang_up_call": handle_hang_up_call,
 }
+
 
 # ---------------------------------------------------------------------------
 # Gemini Live session bridged with Telcoflow
 # ---------------------------------------------------------------------------
 
 
-async def start_gemini_session(call: ActiveCall):
-    """Answer the incoming call and bridge audio with a Gemini Live session."""
+class BookingWorkflowLiveIntegration:
+    """Pipes PCM between `ActiveCall` and Gemini Live, with tool-call handling."""
 
-    await call.answer()
+    def __init__(self, call: ActiveCall, gemini_session: AsyncSession) -> None:
+        self._call = call
+        self._gemini_session = gemini_session
+        self._should_hang_up = asyncio.Event()
+        self._send_task: Optional[asyncio.Task] = None
+        self._recv_task: Optional[asyncio.Task] = None
+        self._hang_up_task: Optional[asyncio.Task] = None
+        self._cleaned_up = False
+        self._transcript_turns: list[tuple[str, str]] = []
+        self._active_transcript_speaker: Optional[str] = None
+        self._active_transcript_parts: list[str] = []
+        self._transcript_flushed = False
 
-    live_config = {
-        "response_modalities": ["AUDIO"],
-        "system_instruction": SYSTEM_INSTRUCTION,
-        "tools": TOOLS,
-    }
+    def _finish_active_transcript_turn(self) -> None:
+        text = "".join(self._active_transcript_parts).strip()
+        if text and self._active_transcript_speaker:
+            self._transcript_turns.append((self._active_transcript_speaker, text))
+        self._active_transcript_speaker = None
+        self._active_transcript_parts = []
 
-    should_hang_up = asyncio.Event()
+    def _record_transcript(self, speaker: str, transcription) -> None:
+        """Store transcript fragments so the dashboard only shows final text."""
+        text = transcription.text or ""
+        if text:
+            if self._active_transcript_speaker not in {None, speaker}:
+                self._finish_active_transcript_turn()
+            self._active_transcript_speaker = speaker
+            self._active_transcript_parts.append(text)
+            logger.info("%s transcription fragment: %s", speaker.title(), text)
 
-    async with gemini_client.aio.live.connect(
-        model=MODEL, config=live_config
-    ) as session:
+        if transcription.finished:
+            self._finish_active_transcript_turn()
 
-        # --- Caller → Gemini --------------------------------------------
-        async def stream_to_gemini():
-            async for chunk in call.audio_stream():
-                await session.send_realtime_input(
+    async def _flush_transcript(self) -> None:
+        if self._transcript_flushed:
+            return
+        self._transcript_flushed = True
+        self._finish_active_transcript_turn()
+        for speaker, text in self._transcript_turns:
+            await emit_transcript(self._call.call_id, speaker, text)
+
+    async def _send_model_turn_audio(self, model_turn) -> None:
+        """Forward model audio only (skip text/thought inline parts)."""
+        if not model_turn:
+            return
+        for part in model_turn.parts:
+            if part.text is not None:
+                logger.info("Received text: %s", part.text)
+            if not part.inline_data or not part.inline_data.data:
+                continue
+            data = part.inline_data.data
+            if not isinstance(data, bytes):
+                continue
+            logger.debug(
+                "send_audio: %d bytes, first4=%s",
+                len(data),
+                data[:4].hex() if data else "empty",
+            )
+            try:
+                await self._call.send_audio(data)
+            except BufferFullError:
+                logger.warning(
+                    "Send buffer full — clearing outbound audio buffer (interrupt)."
+                )
+                await self._call.clear_send_audio_buffer()
+
+    async def _on_call_terminated(self) -> None:
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        logger.info("Received call terminated event — tearing down Gemini session")
+        await self._flush_transcript()
+        await emit_call_ended(self._call.call_id)
+        try:
+            await self._gemini_session.close()
+        except Exception:
+            logger.exception("Error closing Gemini session")
+
+        for task in (self._send_task, self._recv_task, self._hang_up_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except genai_errors.APIError:
+                    pass
+
+        logger.debug("Booking workflow cleanup complete")
+
+    async def stream_to_gemini(self) -> None:
+        try:
+            await self._gemini_session.send_realtime_input(text=GREETING_KICKOFF_REALTIME_TEXT)
+            logger.debug("Sent greeting kickoff to Gemini Live")
+            async for chunk in self._call.audio_stream():
+                await self._gemini_session.send_realtime_input(
                     audio=types.Blob(
                         data=chunk, mime_type=f"audio/pcm;rate={SAMPLE_RATE}"
                     )
                 )
+        except ConnectionClosed:
+            pass
+        except Exception:
+            logger.exception("Error streaming caller audio to Gemini")
+            raise
+        finally:
+            logger.debug("stream_to_gemini task completed")
 
-        # --- Gemini → Caller (+ tool-call handling) ----------------------
-        async def receive_from_gemini():
-            async for response in session.receive():
-                # Audio / interruption handling
-                if content := response.server_content:
-                    if content.interrupted:
-                        await call.clear_send_audio_buffer()
-                    elif content.model_turn:
-                        for part in content.model_turn.parts:
-                            if part.inline_data:
-                                await call.send_audio(part.inline_data.data)
+    async def receive_from_gemini(self) -> None:
+        try:
+            while True:
+                async for response in self._gemini_session.receive():
+                    if content := response.server_content:
+                        if content.interrupted:
+                            await self._call.interrupt()
+                            logger.debug("Gemini interruption — flushed outbound playback")
+                            break
+                        if input_transcription := content.input_transcription:
+                            self._record_transcript("user", input_transcription)
+                        if output_transcription := content.output_transcription:
+                            self._record_transcript("agent", output_transcription)
+                        await self._send_model_turn_audio(content.model_turn)
 
-                # Function-call handling
-                if response.tool_call:
-                    function_responses = []
-                    for fc in response.tool_call.function_calls:
-                        handler = TOOL_HANDLERS.get(fc.name)
-                        if handler:
+                    if response.tool_call:
+                        function_responses = []
+                        for fc in response.tool_call.function_calls:
+                            handler = TOOL_HANDLERS.get(fc.name)
                             args = fc.args if fc.args else {}
-                            result = handler(args)
-                        else:
-                            result = {"error": f"Unknown tool: {fc.name}"}
-
-                        function_responses.append(
-                            types.FunctionResponse(
-                                id=fc.id,
-                                name=fc.name,
-                                response=result,
+                            await emit_tool_call(self._call.call_id, fc.name, dict(args))
+                            result = handler(args) if handler else {"error": f"Unknown tool: {fc.name}"}
+                            if fc.name == "make_booking":
+                                await emit_booking_confirmed(
+                                    self._call.call_id,
+                                    dict(args),
+                                    result,
+                                )
+                                if result.get("status") == "success":
+                                    logger.info(
+                                        "Booking succeeded; scheduling call hang-up"
+                                    )
+                                    self._should_hang_up.set()
+                            function_responses.append(
+                                types.FunctionResponse(
+                                    id=fc.id,
+                                    name=fc.name,
+                                    response=result,
+                                )
                             )
+                            if fc.name == "hang_up_call":
+                                self._should_hang_up.set()
+
+                        await self._gemini_session.send_tool_response(
+                            function_responses=function_responses
                         )
 
-                        if fc.name == "hang_up_call":
-                            should_hang_up.set()
+        except (ConnectionClosed, genai_errors.APIError):
+            logger.debug("Gemini receive ended normally (session or connection closed)")
+        except asyncio.CancelledError:
+            logger.debug("receive_from_gemini task cancelled")
+            raise
+        except Exception:
+            logger.exception("Error receiving from Gemini")
+            raise
+        finally:
+            if not self._cleaned_up:
+                with suppress(Exception):
+                    await self._flush_transcript()
+            logger.debug("receive_from_gemini task completed")
 
-                    await session.send_tool_response(
-                        function_responses=function_responses
-                    )
+    async def hang_up_watcher(self) -> None:
+        await self._should_hang_up.wait()
+        await asyncio.sleep(POST_BOOKING_HANG_UP_DELAY_SECONDS)
+        logger.info("hang_up watcher closing call")
+        await self._call.close()
 
-        # --- Hang-up watcher -------------------------------------------
-        async def hang_up_watcher():
-            """Wait for the hang_up_call signal, let final audio drain, then close."""
-            await should_hang_up.wait()
-            await asyncio.sleep(2)
-            await call.hangup()
+    async def run(self) -> None:
+        self._call.register_event_handler(CallEvent.CALL_TERMINATED, self._on_call_terminated)
+
+        self._send_task = asyncio.create_task(self.stream_to_gemini())
+        self._recv_task = asyncio.create_task(self.receive_from_gemini())
+        self._hang_up_task = asyncio.create_task(self.hang_up_watcher())
 
         await asyncio.gather(
-            stream_to_gemini(),
-            receive_from_gemini(),
-            hang_up_watcher(),
+            self._send_task,
+            self._recv_task,
+            self._hang_up_task,
+            return_exceptions=True,
         )
+
+
+async def start_gemini_session(call: ActiveCall) -> None:
+    """Establish Gemini Live alongside the Telcoflow media leg for one call."""
+
+    try:
+        async with genai_client.aio.live.connect(
+            model=MODEL, config=LIVE_CONNECT_CONFIG
+        ) as session:
+            await call.answer()
+            await emit_call_answered(call.call_id)
+            integration = BookingWorkflowLiveIntegration(call, session)
+            await integration.run()
+    except Exception:
+        logger.exception("Booking workflow session failed")
+        await emit_error(call.call_id, "Booking workflow session failed")
+        await call.close()
 
 
 # ---------------------------------------------------------------------------
@@ -251,25 +462,54 @@ async def start_gemini_session(call: ActiveCall):
 # ---------------------------------------------------------------------------
 
 
-async def main():
+async def main() -> None:
+    dashboard_task: Optional[asyncio.Task] = None
+    if DASHBOARD_ENABLED:
+        from dashboard_server import start_dashboard_server
+
+        dashboard_task = asyncio.create_task(
+            start_dashboard_server(DASHBOARD_HOST, DASHBOARD_PORT),
+            name="dashboard-server",
+        )
+
+    _base_kw = {}
+    _base_from_env = os.getenv("TELCOFLOW_BASE_URL", "").strip().strip('"').strip("'")
+    if _base_from_env:
+        _base_kw["base_url"] = _base_from_env
+
     config = TelcoflowClientConfig.sandbox(
         api_key=os.getenv("WSS_API_KEY"),
         connector_uuid=os.getenv("WSS_CONNECTOR_UUID"),
         sample_rate=SAMPLE_RATE,
+        buffer_size=1024 * 1024,
+        **_base_kw,
     )
 
-    async with TelcoflowClient(config) as tf_client:
+    try:
+        async with TelcoflowClient(config) as tf_client:
 
-        @tf_client.on(events.INCOMING_CALL)
-        async def on_call(call: ActiveCall):
-            print(f"[incoming] Call received — starting Gemini session …")
-            try:
-                await start_gemini_session(call)
-            except Exception as exc:
-                print(f"[error] Session failed: {exc}")
+            @tf_client.on(ClientEvent.INCOMING_CALL)
+            async def on_call(call: ActiveCall) -> None:
+                logger.info(
+                    "Incoming call id=%s — starting Gemini booking session …",
+                    call.call_id,
+                )
+                await emit_call_started(call.call_id)
+                try:
+                    await start_gemini_session(call)
+                except Exception:
+                    logger.exception("Session failed for call_id=%s", call.call_id)
+                    await emit_error(call.call_id, "Session failed")
 
-        print("XanhSM BookBot is live — waiting for calls …")
-        await tf_client.run_forever()
+            logger.info("XanhSM BookBot is live — waiting for calls …")
+            await tf_client.run_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down …")
+    finally:
+        if dashboard_task:
+            dashboard_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await dashboard_task
 
 
 if __name__ == "__main__":
