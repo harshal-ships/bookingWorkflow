@@ -1,5 +1,6 @@
-google-genai>=1.14.0
+--extra-index-url https://test.pypi.org/simple/
 telcoflow-sdk>=0.27.1
+google-genai>=1.14.0
 python-dotenv>=1.1.0
 fastapi
 uvicorn
